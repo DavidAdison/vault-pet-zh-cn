@@ -1,0 +1,884 @@
+'use strict';
+/*
+ * Kit Commit (킷커밋) — Obsidian plugin
+ *
+ * 옵시디언에 글을 쓸수록 자라는 도트 고양이. 데스크톱 앱 킷커밋의 옵시디언판이다.
+ * 고양이·모션·코스튬·장난감·상점·퀘스트·업적·동네 친구·보물 공방은 데스크톱판과 같은 코드(src/kit, src/core)를 쓰고,
+ * Claude Code 토큰 대신 옵시디언 사용량(쓴 글자·링크·새 노트·글쓰기 세션)으로 자라고 코인을 번다.
+ *
+ * 구조
+ *  - src/kit   : 데스크톱판 화면 코드 (펫 창·하우스 창). iframe 안에서 돈다 (plugin/frame.js)
+ *  - src/core  : 데스크톱판 로직 (성장·상점·퀘스트·업적·친구·보물·게이지·기분) + 옵시디언 사용량 집계(usage.js)
+ *  - src/plugin: 데스크톱판 main.js·preload.js 자리 (host.js·frame.js·stage.js) 와 옵시디언 연결(이 파일)
+ */
+const obsidian = require('obsidian');
+const { Plugin, ItemView, Modal, PluginSettingTab, Setting, Notice, TFile, TFolder, addIcon, setIcon } = obsidian;
+const { Store, DEFAULT_SETTINGS } = require('./store');
+const { KitHost, STATE_DEFAULTS } = require('./host');
+const { KitFrame } = require('./frame');
+const { PetStage } = require('./stage');
+const { isLegacy, legacySummary, legacySettings, LEGACY_COSTUME } = require('./legacy');
+const { loadSafe, backupDaily } = require('./safedata');
+const PixelArt = require('../kit/pixelart');
+const { UsageTracker, measure, folderKey, folderOf, LIVE_CHAR_CAP, LIVE_LINK_CAP, FLUSH_BUDGET, OFFLINE_BUDGET } = require('../core/usage');
+
+const VIEW_TYPE = 'kitcommit-house';
+const DATA_VERSION = 1;
+const FEEDBACK_URL = 'https://github.com/elliott-json-park/obsidian-vault-pet/issues/new/choose'; // 버그·아이디어 (누를 때만 브라우저로 연다)
+const MIN = 60_000;
+const PASTE_KEEP = MIN; // 붙여 넣은 글을 '세지 않을 몫'으로 들고 있는 시간
+const TYPE_STOP = 20_000; // 이만큼 손을 떼면 한 차례 쓰기가 끝난 것 (데스크톱판의 'Claude 가 답을 끝냈다')
+const BURST_DONE = 45_000; // 이만큼은 이어서 써야 '다 썼다' 모션을 한다
+const EMPTY_WAIT = 25_000; // 새로 만든 빈 노트가 이만큼 비어 있으면 느낌표 (데스크톱판의 '허락을 기다린다')
+
+// 사용자가 옵시디언에 설정해 둔 언어 ('ko', 'en', 'ja'…). 처음 설치할 때 고양이 언어를 이걸로 고른다.
+// getLanguage() 는 옵시디언 1.8.7 부터 있다. 그 전에는 옵시디언이 화면 언어에 맞춰 둔 moment 로케일을 본다
+function obsidianLanguage() {
+  try {
+    if (typeof obsidian.getLanguage === 'function') return String(obsidian.getLanguage() || 'en').toLowerCase();
+  } catch {
+    // 옛 옵시디언
+  }
+  return String((window.moment && window.moment.locale()) || document.documentElement.lang || 'en').toLowerCase();
+}
+
+/* ────────────────────────────── 하우스 (탭) ────────────────────────────── */
+
+class HouseView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.frame = null;
+    this.tab = null;
+  }
+
+  getViewType() {
+    return VIEW_TYPE;
+  }
+
+  getDisplayText() {
+    const p = this.plugin;
+    return p.host ? p.host.T.t('obs.houseTitle', { name: p.settings.get('petName') }) : 'Vault Pet';
+  }
+
+  getIcon() {
+    return this.plugin.pixelIcon('home') || 'home';
+  }
+
+  async setState(state, result) {
+    if (state && state.tab) {
+      this.tab = state.tab;
+      if (this.frame) this.frame.emit('house:tab', state.tab);
+    }
+    return super.setState(state, result);
+  }
+
+  getState() {
+    return { ...super.getState(), tab: this.tab || null };
+  }
+
+  async onOpen() {
+    this.contentEl.empty();
+    this.contentEl.addClass('kitcommit-house-view');
+    this.mountFrame();
+  }
+
+  mountFrame() {
+    if (this.frame) {
+      this.plugin.host.detachHouse(this.frame);
+      this.frame.destroy();
+    }
+    this.frame = new KitFrame(this.plugin.host, 'house');
+    this.frame.mount(this.contentEl, { tab: this.tab || 'home', fontCss: this.plugin.fontCss(), dark: this.plugin.isDark() });
+    this.plugin.host.attachHouse(this.frame);
+    this.hookKeys();
+  }
+
+  // 하우스(iframe)를 누르면 키보드가 iframe 으로 가서 옵시디언 단축키(Ctrl+P·Ctrl+O·Ctrl+W…)가 안 먹었다.
+  // 하우스를 누르면 이 탭을 지금 탭으로 삼고, 단축키는 옵시디언 쪽으로 넘겨준다
+  hookKeys() {
+    const fw = this.frame && this.frame.win;
+    if (!fw) return;
+    const ws = this.app.workspace;
+    fw.addEventListener('mousedown', () => {
+      if (ws.getActiveViewOfType(HouseView) !== this) ws.setActiveLeaf(this.leaf, { focus: false });
+    }, { capture: true });
+    fw.addEventListener('keydown', (e) => {
+      if (['Control', 'Meta', 'Alt', 'Shift'].includes(e.key)) return;
+      if (!(e.ctrlKey || e.metaKey || e.altKey) && !/^F\d+$/.test(e.key)) return;
+      const t = e.target;
+      const typing = t && (['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || t.isContentEditable);
+      // 글자 칸 안의 전체 선택·복사·붙여넣기·되돌리기는 그 칸에서
+      if (typing && !e.altKey && /^[acvxyz]$/i.test(e.key)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const doc = this.contentEl.ownerDocument;
+      const win = doc.defaultView;
+      if (!this.frame) return;
+      this.frame.iframe.blur();
+      win.focus();
+      const init = { key: e.key, code: e.code, ctrlKey: e.ctrlKey, metaKey: e.metaKey, shiftKey: e.shiftKey, altKey: e.altKey, repeat: e.repeat, bubbles: true, cancelable: true };
+      const target = doc.activeElement && doc.activeElement !== this.frame.iframe ? doc.activeElement : doc.body;
+      target.dispatchEvent(new win.KeyboardEvent('keydown', init));
+    }, { capture: true });
+  }
+
+  // 탭을 새 창(팝아웃)이나 다른 분할 창으로 옮기면 iframe 이 새로 읽히면서 비어 버린다. 그러면 다시 올린다
+  // (같은 창 안에서 옮기면 문서는 같지만 iframe 안 창이 새것으로 바뀐다)
+  onResize() {
+    const fr = this.frame;
+    if (!fr) return;
+    const stale = !fr.win || !fr.iframe || fr.iframe.contentWindow !== fr.win || fr.iframe.ownerDocument !== this.contentEl.ownerDocument;
+    // 화면 코드가 터져서 못 올라온 거면 크기가 바뀔 때마다 다시 만들지 않는다 (한 번 실패하면 그대로)
+    if (stale || (!fr.win.__kcLoaded && !fr.failed)) this.mountFrame();
+  }
+
+  async onClose() {
+    if (this.frame) {
+      this.plugin.host.detachHouse(this.frame);
+      this.frame.destroy();
+    }
+    this.frame = null;
+  }
+}
+
+/* ────────────────────────────── 설정 탭 (옵시디언) ────────────────────────────── */
+// 자세한 설정은 하우스 → 설정 탭에 있다 (데스크톱판과 같다). 여기에는 자주 쓰는 것만
+
+class KitSettingTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const p = this.plugin;
+    const t = (k, v) => p.host.T.t(k, v);
+    const el = this.containerEl;
+    el.empty();
+    el.createEl('p', { text: t('obs.settingsIntro'), cls: 'setting-item-description' });
+    new Setting(el)
+      .setName(t('obs.openHouse'))
+      .setDesc(t('obs.openHouseDesc'))
+      .addButton((b) => b.setButtonText(t('obs.openHouse')).setCta().onClick(() => p.openHouse('settings')));
+    new Setting(el)
+      .setName(t('obs.showPet'))
+      .setDesc(t('obs.showPetDesc'))
+      .addToggle((tg) => tg.setValue(!!p.settings.get('showPet')).onChange((v) => p.host.setSettings({ showPet: v })));
+    new Setting(el)
+      .setName(t('obs.houseSide'))
+      .setDesc(t('obs.houseSideDesc'))
+      .addToggle((tg) =>
+        tg.setValue(!!p.settings.get('houseInSidebar')).onChange((v) => {
+          p.settings.set({ houseInSidebar: v });
+          p.openHouse(null, v ? 'side' : 'tab');
+        }),
+      );
+    new Setting(el)
+      .setName(t('set.mute'))
+      .setDesc(t('set.muteSub'))
+      .addToggle((tg) => tg.setValue(!p.settings.get('soundEnabled')).onChange((v) => p.host.setSettings({ soundEnabled: !v })));
+    new Setting(el)
+      .setName(t('set.language'))
+      .addDropdown((d) =>
+        d
+          .addOption('ko', '한국어')
+          .addOption('en', 'English')
+          .setValue(p.settings.get('language'))
+          .onChange((v) => {
+            p.host.setSettings({ language: v });
+            this.display();
+          }),
+      );
+    new Setting(el)
+      .setName(t('tray.resetPos'))
+      .addButton((b) => b.setButtonText(t('tray.resetPos')).onClick(() => p.host.resetPosition()));
+    new Setting(el)
+      .setName(t('obs.feedback'))
+      .setDesc(t('obs.feedbackDesc'))
+      .addButton((b) => b.setButtonText(t('obs.feedbackBtn')).onClick(() => p.openFeedback()));
+    el.createEl('p', { text: t('set.disclaimer'), cls: 'setting-item-description kitcommit-disclaimer' });
+  }
+}
+
+/* ────────────────────────────── Vault Pet 0.x 사용자 안내 (한 번만) ────────────────────────────── */
+
+class LegacyModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    const p = this.plugin;
+    const t = (k, v) => p.host.T.t(k, v);
+    const L = p.meta.legacy;
+    const fmt = (n) => Number(n).toLocaleString(p.settings.get('language') === 'ko' ? 'ko-KR' : 'en-US');
+    this.modalEl.addClass('vaultpet-legacy');
+    this.titleEl.setText(t('legacy.title'));
+    const el = this.contentEl;
+    el.empty();
+    el.createEl('p', { text: t('legacy.thanks', { days: fmt(L.days), lv: L.level }) });
+    el.createEl('p', { text: t('legacy.body') });
+    const gifts = el.createDiv({ cls: 'vaultpet-legacy-gifts' });
+    const row = (icon, text) => {
+      const r = gifts.createDiv({ cls: 'vaultpet-legacy-gift' });
+      const id = p.pixelIcon(icon);
+      if (id) setIcon(r.createSpan({ cls: 'vaultpet-legacy-icon' }), id);
+      r.createSpan({ text });
+    };
+    row('coin', t('legacy.coins', { coins: fmt(L.coins) }));
+    row(LEGACY_COSTUME, t('legacy.costume'));
+    if (L.partialFolders) el.createEl('p', { text: t('legacy.folders', { n: L.partialFolders }), cls: 'setting-item-description' });
+    el.createEl('p', { text: t('legacy.note'), cls: 'setting-item-description' });
+    new Setting(el)
+      .addButton((b) => b.setButtonText(t('legacy.ok')).onClick(() => this.close()))
+      .addButton((b) =>
+        b
+          .setButtonText(t('legacy.wear'))
+          .setCta()
+          .onClick(() => {
+            p.host.setSettings({ outfit: { head: LEGACY_COSTUME } });
+            this.close();
+            p.openHouse('wardrobe');
+          }),
+      );
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    const L = this.plugin.meta.legacy;
+    if (L && !L.shown) {
+      L.shown = true;
+      this.plugin.saveSoon();
+    }
+  }
+}
+
+/* ────────────────────────────── 플러그인 ────────────────────────────── */
+
+class KitCommitPlugin extends Plugin {
+  async onload() {
+    // 깨진 data.json 은 백업으로 되살린다 (safedata.js). 되살렸는지는 start() 에서 알린다
+    const loaded = await loadSafe(this.app.vault.adapter, this.manifest.dir);
+    this.loadSource = loaded.source;
+    let raw = loaded.raw || {};
+    // 백업할 것: 방금 잘 읽힌 자료 (0.x 자료는 곧 새 형식으로 바뀌니 빼 둔다)
+    this.loadedRaw = loaded.source === 'data' && !isLegacy(raw) ? raw : null;
+    // Vault Pet 0.x 에서 업데이트했다: 예전 기록은 선물로 바꾸고, 새 고양이는 처음부터 (설정 몇 가지·이름만 옮긴다)
+    const legacy = isLegacy(raw) ? legacySummary(raw) : null;
+    if (legacy) raw = { settings: legacySettings(raw) };
+    const firstInstall = !raw.settings || !!legacy;
+    const saveHook = (now) => (now ? this.saveNow() : this.saveSoon());
+    this.settings = new Store(raw.settings, DEFAULT_SETTINGS, saveHook);
+    this.state = new Store(raw.state, STATE_DEFAULTS, saveHook);
+    this.meta = { scanned: false, baseline: { c: 0, l: 0, n: 0, s: 0 }, ...(raw.meta || {}) };
+    // 지난번에 마지막으로 저장한 때. 그 뒤로 안 바뀐 노트는 꺼져 있던 동안 쓴 글이 아니다 (scan)
+    this.prevSeen = this.meta.lastSeen || 0;
+    this.usage = new UsageTracker(raw.usage);
+    this.usage.on('session', ({ at }) => this.onSession(at));
+    // 처음 설치하면 옵시디언 언어를 따른다
+    if (firstInstall) {
+      if (!(raw.settings || {}).language) {
+        const lang = obsidianLanguage();
+        this.settings.data.language = lang.startsWith('ko') ? 'ko' : 'en';
+      }
+      if (legacy && legacy.petName) this.settings.data.petName = legacy.petName;
+      else if (this.settings.data.language === 'en') this.settings.data.petName = 'Kit';
+    }
+    this.pending = new Set();
+    this.pasted = new Map(); // 노트 경로 → 붙여넣기·끌어다 놓기로 들어온 글 { c, l, at } (세지 않는다)
+    this.icons = new Set();
+    this.lastInput = Date.now();
+    this.loadingProgress = null;
+
+    this.host = new KitHost(this, { settings: this.settings, state: this.state, usage: this.usage });
+    this.host.init();
+    this.stage = null;
+    if (legacy) {
+      // 선물: 코인은 지갑 보너스로, 기념 코스튬은 옷장에. 새 형식으로 바로 저장해서 두 번 받지 않게 한다
+      this.state.set({ walletBonus: (this.state.get('walletBonus') || 0) + legacy.coins });
+      this.host.shop.give({ item: LEGACY_COSTUME });
+      this.meta.legacy = { ...legacy, at: Date.now(), shown: false };
+      await this.saveNow();
+    }
+
+    this.registerView(VIEW_TYPE, (leaf) => new HouseView(leaf, this));
+    this.ribbon = this.addRibbonIcon(this.pixelIcon('catface', true) || 'cat', this.host.T.t('obs.openHouse'), () => this.openHouse());
+    this.statusEl = this.addStatusBarItem();
+    this.statusEl.addClass('kitcommit-status', 'mod-clickable');
+    this.registerDomEvent(this.statusEl, 'click', (e) => this.host.trayMenu(e));
+    this.addCommands();
+    this.addSettingTab(new KitSettingTab(this.app, this));
+
+    // 키보드·마우스를 마지막으로 만진 때 (데스크톱판의 powerMonitor.getSystemIdleTime 자리)
+    const touch = () => (this.lastInput = Date.now());
+    for (const ev of ['keydown', 'mousedown', 'wheel']) this.registerDomEvent(document, ev, touch, { capture: true, passive: true });
+    this.registerDomEvent(document, 'mousemove', () => {
+      const now = Date.now();
+      if (now - this.lastInput > 2000) this.lastInput = now;
+    }, { capture: true, passive: true });
+
+    // 밝기: 옵시디언 테마를 따라간다
+    this.registerEvent(this.app.workspace.on('css-change', () => this.applyTheme()));
+    this.app.workspace.onLayoutReady(() => this.start());
+  }
+
+  onunload() {
+    window.clearTimeout(this.saveTimer);
+    window.clearTimeout(this.flushTimer);
+    window.clearTimeout(this.stopTimer);
+    window.clearTimeout(this.emptyTimer);
+    this.saveNow();
+    this.unmountStage();
+    if (this.host) this.host.destroy();
+  }
+
+  addCommands() {
+    const T = () => this.host.T;
+    const cmd = (id, key, callback) => this.addCommand({ id, name: T().t(key), callback });
+    cmd('open-house', 'obs.cmd.house', () => this.openHouse());
+    cmd('open-house-sidebar', 'obs.cmd.houseSide', () => this.openHouse(null, 'side'));
+    cmd('open-quests', 'obs.cmd.quests', () => this.openHouse('quests'));
+    cmd('open-shop', 'obs.cmd.shop', () => this.openHouse('shop'));
+    cmd('open-wardrobe', 'obs.cmd.wardrobe', () => this.openHouse('wardrobe'));
+    cmd('feed', 'obs.cmd.feed', () => {
+      const r = this.host.feed();
+      if (!r.ok) {
+        new Notice(T().t('toast.noMeal'));
+        this.openHouse('shop');
+      }
+    });
+    cmd('pet', 'obs.cmd.pet', () => this.host.poke());
+    cmd('toggle-mute', 'obs.cmd.mute', () => {
+      const on = !this.settings.get('soundEnabled');
+      this.host.setSettings({ soundEnabled: on });
+      new Notice(T().t(on ? 'toast.unmuted' : 'toast.muted'));
+    });
+    cmd('toggle-quiet', 'obs.cmd.quiet', () => this.host.setQuiet(this.host.isQuiet() ? 0 : 60));
+    cmd('toggle-pet', 'obs.cmd.toggle', () => (this.settings.get('showPet') ? this.host.turnOff() : this.host.showPet()));
+    cmd('hide-hour', 'obs.cmd.hide', () => this.host.hideFor(60 * MIN));
+    cmd('reset-position', 'obs.cmd.position', () => this.host.resetPosition());
+    cmd('stop-play', 'obs.cmd.stopPlay', () => this.host.stopPlay());
+  }
+
+  async start() {
+    this.started = true;
+    const { vault, workspace } = this.app;
+    if (this.settings.get('showPet')) this.mountStage();
+
+    this.registerEvent(vault.on('modify', (f) => this.queue(f)));
+    this.registerEvent(vault.on('create', (f) => this.onCreate(f)));
+    this.registerEvent(vault.on('delete', (f) => {
+      if (f instanceof TFolder) this.usage.removeUnder(f.path);
+      else this.usage.remove(f.path);
+      this.saveSoon();
+    }));
+    this.registerEvent(vault.on('rename', (f, old) => {
+      // 기록 없는 노트(뺀 폴더에 있던 노트 등)가 옮겨 들어오면 지금 크기를 기준으로만 잡는다 (옮긴 건 새로 쓴 글이 아니다)
+      const fresh = (f instanceof TFolder ? this.app.vault.getMarkdownFiles().filter((x) => x.path.startsWith(f.path + '/')) : [f])
+        .filter((x) => x instanceof TFile && x.extension === 'md' && !this.usage.known(old + x.path.slice(f.path.length)));
+      this.usage.rename(old, f.path);
+      for (const x of fresh) this.baselineFile(x);
+      this.saveSoon();
+    }));
+    // 붙여넣기·끌어다 놓기로 들어온 글은 경험치·코인이 되지 않는다 (README '공정하게')
+    this.registerEvent(workspace.on('editor-paste', (evt, editor, info) => this.notePasted(info && info.file, evt.clipboardData)));
+    this.registerEvent(workspace.on('editor-drop', (evt, editor, info) => this.notePasted(info && info.file, evt.dataTransfer)));
+    // 열린 노트가 밖에서 바뀌어도 editor-change 가 온다. 편집기에 포커스가 있을 때만 타이핑으로 본다
+    this.registerEvent(workspace.on('editor-change', (editor) => {
+      if (editor && typeof editor.hasFocus === 'function' && !editor.hasFocus()) return;
+      this.onType();
+    }));
+    this.registerEvent(workspace.on('file-open', (f) => f && this.onOpen(f)));
+    this.registerInterval(window.setInterval(() => this.host.fastTick(), 5000));
+    this.registerInterval(window.setInterval(() => {
+      this.host.minuteTick();
+      this.saveSoon();
+    }, MIN));
+
+    this.host.brain.activity(Date.now());
+    this.host.brain.tick();
+    this.updateStatus();
+    // 처음이면 하우스에서 안내부터 (데스크톱판처럼)
+    if (!this.state.get('onboarded')) this.openHouse('home');
+    if (this.meta.legacy && !this.meta.legacy.shown) new LegacyModal(this.app, this).open();
+    if (this.loadSource === 'backup' || this.loadSource === 'lost') new Notice(this.host.T.t(this.loadSource === 'backup' ? 'obs.dataRestored' : 'obs.dataLost'), 15000);
+    this.backup();
+    await this.scan();
+    this.host.ready();
+    this.updateStatus();
+    this.saveSoon();
+  }
+
+  /* ── 펫 무대 ── */
+
+  mountStage() {
+    if (this.stage || !this.started) return;
+    this.stage = new PetStage(this, this.host);
+    this.host.stage = this.stage;
+    this.stage.mount();
+  }
+
+  unmountStage() {
+    if (!this.stage) return;
+    this.stage.unmount();
+    this.stage = null;
+    if (this.host) this.host.stage = null;
+  }
+
+  /* ── 하우스 ── */
+
+  // where: 'side' = 오른쪽 사이드바, 'tab' = 가운데 탭. 안 주면 설정(houseInSidebar)을 따른다.
+  // 이미 열린 하우스가 있으면 그 자리를 그대로 쓴다 (다른 자리로 열어 달라고 했으면 옮긴다)
+  async openHouse(tab, where) {
+    const { workspace } = this.app;
+    const side = (where || (this.settings.get('houseInSidebar') ? 'side' : 'tab')) === 'side';
+    let leaf = workspace.getLeavesOfType(VIEW_TYPE)[0];
+    if (leaf && where && (leaf.getRoot() === workspace.rightSplit) !== side) {
+      leaf.detach();
+      leaf = null;
+    }
+    if (leaf) {
+      if (tab) {
+        const v = leaf.view;
+        if (v instanceof HouseView && v.frame) {
+          v.tab = tab;
+          v.frame.emit('house:tab', tab);
+        } else await leaf.setViewState({ type: VIEW_TYPE, active: true, state: { tab } });
+      }
+    } else {
+      leaf = side ? workspace.getRightLeaf(false) : workspace.getLeaf('tab');
+      await leaf.setViewState({ type: VIEW_TYPE, active: true, state: { tab: tab || 'home' } });
+    }
+    workspace.revealLeaf(leaf);
+  }
+
+  houseViews() {
+    return this.app.workspace.getLeavesOfType(VIEW_TYPE).map((l) => l.view).filter((v) => v instanceof HouseView);
+  }
+
+  /* ── 볼트 읽기 ── */
+
+  // 숨김 폴더와, 설정에서 뺀 폴더(맨 윗단)는 읽지도 세지도 않는다
+  isExcludedPath(path) {
+    if (path.startsWith('.') || path.split('/').some((x) => x.startsWith('.'))) return true;
+    const ex = this.settings.get('excludedProjects') || [];
+    return ex.length > 0 && ex.includes(folderKey(folderOf(path)));
+  }
+
+  notePasted(file, data) {
+    if (!file || !data || typeof data.getData !== 'function') return;
+    const m = measure(data.getData('text/plain') || '');
+    if (!m.chars && !m.links) return;
+    const p = this.pasted.get(file.path);
+    const fresh = p && Date.now() - p.at < PASTE_KEEP;
+    this.pasted.set(file.path, { c: (fresh ? p.c : 0) + m.chars, l: (fresh ? p.l : 0) + m.links, at: Date.now() });
+  }
+
+  async baselineFile(f) {
+    if (this.isExcludedPath(f.path)) return;
+    try {
+      this.usage.observe(f.path, measure(await this.app.vault.cachedRead(f)), new Date(), { mtime: f.stat.mtime, baseline: true });
+      this.saveSoon();
+    } catch {
+      // 못 읽으면 다음 기회에 (그때는 상한 안에서 센다)
+    }
+  }
+
+  // 뺐던 폴더를 다시 넣었다. 그동안 안 읽었으니, 지금 크기를 기준으로만 잡는다 (뺀 동안 쓴 글이 한꺼번에 세지지 않게)
+  async rebaseline(ids) {
+    const want = new Set(ids);
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (!want.has(folderKey(folderOf(f.path)))) continue;
+      try {
+        this.usage.observe(f.path, measure(await this.app.vault.cachedRead(f)), new Date(), { mtime: f.stat.mtime, baseline: true });
+      } catch {
+        // 못 읽으면 다음 기회에
+      }
+    }
+    this.saveSoon();
+  }
+
+  // 처음 설치했을 때는 볼트 전체를 한 번 읽어, 이미 있던 노트의 크기만 기억한다 (이미 써 둔 글은 세지 않는다).
+  // 그다음부터는 옵시디언이 꺼져 있던 동안 바뀐 노트만 다시 읽는다.
+  async scan() {
+    const { vault } = this.app;
+    const U = this.usage;
+    const all = vault.getMarkdownFiles();
+    const files = all.filter((f) => !this.isExcludedPath(f.path));
+    if (!this.meta.scanned) {
+      this.setLoading(0);
+      const base = { c: 0, l: 0, n: 0, s: 0 };
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        try {
+          const m = measure(await vault.cachedRead(f));
+          U.observe(f.path, m, new Date(), { mtime: f.stat.mtime, baseline: true });
+          base.c += m.chars;
+          base.l += m.links;
+          if (m.chars >= 10) base.n++;
+        } catch {
+          // 못 읽는 파일은 건너뛴다
+        }
+        if (i % 40 === 39) {
+          this.setLoading((i + 1) / files.length);
+          await new Promise((r) => window.setTimeout(r, 0));
+        }
+      }
+      for (const f of vault.getFiles()) if (f.extension === 'canvas') U.observe(f.path, { chars: 0, links: 0 }, new Date(), { baseline: true, mtime: f.stat.mtime });
+      this.meta.baseline = base;
+      this.meta.scanned = true;
+    } else {
+      const budget = { ...OFFLINE_BUDGET };
+      U.keepOnly(vault.getFiles().map((f) => f.path));
+      for (const f of files) {
+        const seen = U.mtimeOf(f.path);
+        if (seen !== null && seen >= f.stat.mtime) continue;
+        // 기록이 없는데 지난번 저장 전부터 그대로인 노트 = 뺀 폴더에서 옮겨 왔거나 밖에서 들어온 노트. 기준만 잡는다
+        const moved = seen === null && !U.known(f.path) && this.prevSeen && f.stat.mtime <= this.prevSeen;
+        try {
+          const m = measure(await vault.cachedRead(f));
+          if (moved) U.observe(f.path, m, new Date(), { mtime: f.stat.mtime, baseline: true });
+          else U.observe(f.path, m, new Date(f.stat.mtime), { mtime: f.stat.mtime, cap: LIVE_CHAR_CAP, linkCap: LIVE_LINK_CAP, budget, offline: true });
+        } catch {
+          // 다음 기회에
+        }
+      }
+    }
+    this.setLoading(null);
+    this.saveSoon();
+  }
+
+  setLoading(p) {
+    this.loadingProgress = p;
+    this.host.send('pet:loading', p);
+  }
+
+  baselineTotals() {
+    return this.meta.baseline || { c: 0, l: 0, n: 0, s: 0 };
+  }
+
+  onCreate(f) {
+    if (!(f instanceof TFile) || this.isExcludedPath(f.path)) return;
+    if (f.extension === 'canvas') {
+      this.usage.canvas(f.path);
+      this.saveSoon();
+      this.host.onUsage();
+      return;
+    }
+    if (f.extension !== 'md') return;
+    // 빈 노트를 새로 만들었다. 한참 비어 있으면 고양이가 느낌표를 띄우고 기다린다
+    if (!f.stat.size) {
+      this.emptyNote = f.path;
+      this.armEmptyWait();
+    }
+    this.queue(f);
+  }
+
+  armEmptyWait() {
+    window.clearTimeout(this.emptyTimer);
+    this.emptyTimer = window.setTimeout(() => {
+      const f = this.emptyNote && this.app.vault.getAbstractFileByPath(this.emptyNote);
+      const active = this.app.workspace.getActiveFile();
+      if (!(f instanceof TFile) || f.stat.size || !active || active.path !== f.path || this.typing) return;
+      this.host.brain.hook({ name: 'Notification', at: Date.now(), sessionId: 'obsidian', notificationType: 'idle_prompt', message: '' });
+    }, EMPTY_WAIT);
+  }
+
+  queue(f) {
+    if (!(f instanceof TFile) || f.extension !== 'md' || this.isExcludedPath(f.path)) return;
+    this.pending.add(f.path);
+    window.clearTimeout(this.flushTimer);
+    this.flushTimer = window.setTimeout(() => this.flush(), 1500);
+  }
+
+  async flush() {
+    if (!this.meta.scanned) {
+      this.flushTimer = window.setTimeout(() => this.flush(), 2000);
+      return;
+    }
+    const paths = [...this.pending];
+    this.pending.clear();
+    const sum = { dc: 0, dl: 0, dn: 0, feat: 0 };
+    const budget = { ...FLUSH_BUDGET };
+    for (const path of paths) {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (!(f instanceof TFile)) continue;
+      let text;
+      try {
+        text = await this.app.vault.cachedRead(f);
+      } catch {
+        continue;
+      }
+      const paste = this.pasted.get(path);
+      if (paste && Date.now() - paste.at > PASTE_KEEP) this.pasted.delete(path);
+      const skip = this.pasted.get(path);
+      const r = this.usage.observe(path, measure(text), new Date(), { mtime: f.stat.mtime, cap: LIVE_CHAR_CAP, linkCap: LIVE_LINK_CAP, budget, skip });
+      if (skip) {
+        // 붙여 넣은 글이 아직 파일에 다 안 들어왔을 수 있다. 남은 몫은 조금 더 들고 있는다
+        skip.c -= r.skipped.c;
+        skip.l -= r.skipped.l;
+        if (skip.c <= 0 && skip.l <= 0) this.pasted.delete(path);
+      }
+      sum.dc += r.dc;
+      sum.dl += r.dl;
+      sum.dn += r.dn;
+      sum.feat += Object.keys(r.feat || {}).length;
+      if (path === this.emptyNote && f.stat.size) {
+        this.emptyNote = null;
+        this.host.brain.answered();
+      }
+    }
+    this.saveSoon();
+    if (!sum.dc && !sum.dl && !sum.dn && !sum.feat) return;
+    this.host.onUsage();
+  }
+
+  // 편집기에서 글을 쓰는 중 (데스크톱판에서 Claude 가 답을 쓰는 동안 = 노트북 꺼내 같이 타이핑)
+  onType() {
+    const now = Date.now();
+    const brain = this.host.brain;
+    if (!this.typing) {
+      this.typing = true;
+      this.typeStart = now;
+      brain.hook({ name: 'UserPromptSubmit', at: now, sessionId: 'obsidian' });
+    } else if (now - (this.lastType || 0) > 1000) brain.activity(now);
+    this.lastType = now;
+    window.clearTimeout(this.stopTimer);
+    this.stopTimer = window.setTimeout(() => this.typeStop(), TYPE_STOP);
+  }
+
+  // 한 차례 쓰기를 마쳤다. 오래 썼으면 '다 썼다' 모션 (데스크톱판의 Stop hook)
+  typeStop() {
+    this.typing = false;
+    const brain = this.host.brain;
+    const long = this.lastType - this.typeStart >= BURST_DONE;
+    if (long) brain.hook({ name: 'Stop', at: Date.now(), sessionId: 'obsidian' });
+    else {
+      brain.generating = 0;
+      brain.tick();
+    }
+  }
+
+  onOpen(f) {
+    const brain = this.host.brain;
+    brain.activity(Date.now());
+    // 다른 노트로 가면 빈 노트를 기다리던 건 그만
+    if (this.emptyNote && f.path !== this.emptyNote) {
+      this.emptyNote = null;
+      brain.answered();
+    } else if (this.emptyNote === f.path) this.armEmptyWait();
+    if (f.extension !== 'md' || this.isExcludedPath(f.path)) return;
+    this.usage.open(f.path);
+    this.saveSoon();
+    window.clearTimeout(this.openTimer);
+    this.openTimer = window.setTimeout(() => this.host.onUsage(), 800);
+  }
+
+  // 글쓰기 세션이 새로 열렸다 (usage 가 알려 준다)
+  onSession(at) {
+    this.host.brain.hook({ name: 'SessionStart', at, sessionId: 'obsidian', source: 'startup' });
+  }
+
+  idleSeconds() {
+    return Math.max(0, (Date.now() - this.lastInput) / 1000);
+  }
+
+  // 볼트 맨 윗단 폴더 이름들 (설정의 '경험치에 넣을 폴더')
+  topFolders() {
+    return this.app.vault.getRoot().children.filter((x) => x instanceof TFolder && !x.name.startsWith('.')).map((x) => x.name);
+  }
+
+  // 백링크가 가장 많은 노트의 백링크 수. 2분 동안 기억한다
+  linkStats() {
+    const now = Date.now();
+    if (this._links && now - this._links.at < 2 * MIN) return this._links;
+    const counts = {};
+    let total = 0;
+    const resolved = this.app.metadataCache.resolvedLinks || {};
+    for (const [src, targets] of Object.entries(resolved)) {
+      for (const [dst, n] of Object.entries(targets)) {
+        total += n;
+        if (dst !== src) counts[dst] = (counts[dst] || 0) + 1;
+      }
+    }
+    this._links = { at: now, max: Math.max(0, ...Object.values(counts)), total };
+    return this._links;
+  }
+
+  // 볼트 전체 숫자 (통계의 누적 기록 · 자랑 카드)
+  vaultNumbers() {
+    let chars = 0;
+    for (const f of Object.values(this.usage.data.files)) chars += f[0] || 0;
+    return { notes: this.app.vault.getMarkdownFiles().length, chars, links: this.linkStats().total };
+  }
+
+  /* ── 자랑 카드 ── */
+
+  async saveCard(dataUrl, name) {
+    try {
+      const b64 = dataUrl.split(',')[1] || '';
+      const bin = atob(b64);
+      const buf = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      const file = `vault-pet-${String(name).replace(/[\\/:*?"<>|#^[\]]/g, '') || 'cat'}.png`;
+      const active = this.app.workspace.getActiveFile();
+      const path = await this.app.fileManager.getAvailablePathForAttachment(file, active ? active.path : '');
+      await this.app.vault.createBinary(path, buf.buffer);
+      new Notice(this.host.T.t('obs.cardSaved', { path }));
+      return true;
+    } catch (e) {
+      console.error('[Vault Pet] card', e);
+      new Notice(String(e && e.message ? e.message : e));
+      return false;
+    }
+  }
+
+  async copyImage(dataUrl) {
+    try {
+      const blob = await (await fetch(dataUrl)).blob();
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+      return true;
+    } catch (e) {
+      console.error('[Vault Pet] copy', e);
+      return false;
+    }
+  }
+
+  async copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // 처음부터 다시 키우기. 고양이·지갑·업적·퀘스트·창고를 지우고 플러그인을 다시 켠다.
+  // 언어·뺀 폴더·고양이 자리는 남긴다. 노트마다 최고 기록은 남겨서 이미 쓴 글이 다시 세지지 않고,
+  // 시간별 기록은 비운다 (데스크톱판은 Claude 기록이 따로 있어서 남겼지만, 옵시디언판은 이 기록이 전부라 같은 시간대 글이 다시 세지지 않게)
+  resetAll() {
+    const keep = ['language', 'excludedProjects', 'position', 'showPet'];
+    this.settings.data = { ...structuredClone(DEFAULT_SETTINGS), ...Object.fromEntries(keep.map((k) => [k, this.settings.get(k)])) };
+    this.state.data = structuredClone(STATE_DEFAULTS);
+    this.usage.data.projects = {};
+    this.usage.data.lastEdit = 0;
+    this.saveNow();
+    window.setTimeout(async () => {
+      const id = this.manifest.id;
+      const plugins = this.app.plugins;
+      await plugins.disablePlugin(id);
+      await plugins.enablePlugin(id);
+    }, 300);
+  }
+
+  /* ── 모양 ── */
+
+  isDark() {
+    return document.body.classList.contains('theme-dark');
+  }
+
+  applyTheme() {
+    const dark = this.isDark();
+    if (this.stage && this.stage.frame) this.stage.frame.setDark(dark);
+    for (const v of this.houseViews()) if (v.frame) v.frame.setDark(dark);
+  }
+
+  // 글꼴: 플러그인 폴더에 fonts/ 가 있으면 프리텐다드를 쓴다 (없으면 설치된 글꼴 → 시스템 글꼴)
+  fontCss() {
+    if (this._fontCss !== undefined) return this._fontCss;
+    const dir = this.manifest.dir;
+    const url = (f) => this.app.vault.adapter.getResourcePath(`${dir}/fonts/${f}`);
+    let css = '';
+    try {
+      css = `@font-face{font-family:'Pretendard';font-weight:400;font-display:swap;src:local('Pretendard Variable'),local('Pretendard Regular'),local('Pretendard'),url('${url('Pretendard-Regular.otf')}') format('opentype');}
+@font-face{font-family:'Pretendard';font-weight:700;font-display:swap;src:local('Pretendard Variable'),local('Pretendard Bold'),url('${url('Pretendard-Bold.otf')}') format('opentype');}`;
+    } catch {
+      css = '';
+    }
+    this._fontCss = css;
+    return css;
+  }
+
+  // 도트 아이콘을 옵시디언 아이콘으로 등록하고 이름을 돌려준다 (메뉴·리본·탭 아이콘)
+  // mono: 색을 빼고 글자색(currentColor)으로 — 리본처럼 옵시디언 기본 아이콘들 사이에 놓이는 곳
+  pixelIcon(name, mono = false) {
+    if (!PixelArt.has(name)) return null;
+    const id = 'kitcommit-' + name + (mono ? '-mono' : '');
+    if (!this.icons.has(id)) {
+      // 한 색 아이콘은 옵시디언 기본 아이콘(가장자리 여백이 있다)과 크기가 맞게 조금 작게
+      let svg = PixelArt.svg(name, mono ? 84 : 100);
+      if (mono) svg = svg.replace(/fill="#[0-9a-fA-F]+"/g, 'fill="currentColor"');
+      const w = Number((svg.match(/width="(\d+)"/) || [])[1]) || 100;
+      const h = Number((svg.match(/height="(\d+)"/) || [])[1]) || 100;
+      addIcon(id, svg.replace(/^<svg class="[^"]*"/, `<svg x="${(100 - w) / 2}" y="${(100 - h) / 2}" style="stroke:none"`));
+      this.icons.add(id);
+    }
+    return id;
+  }
+
+  // 상태 표시줄: 발바닥 · 이름 · 레벨 (데스크톱판의 트레이 아이콘 자리). 누르면 트레이 메뉴
+  updateStatus() {
+    const el = this.statusEl;
+    if (!el || !this.host) return;
+    const g = this.host.growth;
+    const name = this.settings.get('petName');
+    const text = g ? `${name} Lv.${g.level}` : name;
+    const key = `${text}|${this.host.isQuiet()}|${this.host.petVisible()}`;
+    if (this._status === key) return;
+    this._status = key;
+    el.empty();
+    const ic = el.createSpan({ cls: 'kitcommit-status-icon' });
+    const svg = new DOMParser().parseFromString(PixelArt.svg(this.host.isQuiet() ? 'bellOff' : 'paw', 14).replace('<svg ', '<svg xmlns="http://www.w3.org/2000/svg" '), 'image/svg+xml').documentElement;
+    ic.appendChild(document.importNode(svg, true));
+    el.createSpan({ text });
+    el.setAttribute('aria-label', this.host.T.t('obs.statusTip'));
+  }
+
+  // 언어가 바뀌면 탭 이름·리본 설명을 다시
+  relabel() {
+    this._status = null;
+    this.updateStatus();
+    if (this.ribbon) this.ribbon.setAttribute('aria-label', this.host.T.t('obs.openHouse'));
+    for (const v of this.houseViews()) if (v.leaf && typeof v.leaf.updateHeader === 'function') v.leaf.updateHeader();
+  }
+
+  /* ── 저장 ── */
+
+  // 하루에 한 번, 방금 잘 읽힌 data.json 을 data.backup.json 으로 남긴다
+  backup() {
+    const raw = this.loadedRaw;
+    this.loadedRaw = null;
+    const d = new Date();
+    const today = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+    backupDaily(this.app.vault.adapter, this.manifest.dir, raw, this.meta.backupDay, today)
+      .then((done) => {
+        if (!done) return;
+        this.meta.backupDay = today;
+        this.saveSoon();
+      })
+      .catch((e) => console.error('[Vault Pet] backup', e));
+  }
+
+  openFeedback() {
+    window.open(FEEDBACK_URL);
+  }
+
+  saveSoon() {
+    this.dirty = true;
+    window.clearTimeout(this.saveTimer);
+    this.saveTimer = window.setTimeout(() => this.saveNow(), 1500);
+  }
+
+  saveNow() {
+    window.clearTimeout(this.saveTimer);
+    if (!this.settings) return;
+    this.dirty = false;
+    this.meta.lastSeen = Date.now();
+    return this.saveData({ version: DATA_VERSION, settings: this.settings.data, state: this.state.data, usage: this.usage.data, meta: this.meta }).catch((e) => console.error('[Vault Pet] save', e));
+  }
+}
+
+module.exports = KitCommitPlugin;
+module.exports.default = KitCommitPlugin;
