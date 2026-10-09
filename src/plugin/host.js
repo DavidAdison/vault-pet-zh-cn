@@ -11,7 +11,7 @@ const { Treasures, TREASURES } = require('../core/treasure');
 const { Workshop } = require('../core/workshop');
 const { Friends, FRIENDS, FRIEND_STEPS } = require('../core/friends');
 const { Gauge } = require('../core/gauge');
-const { Strings, LANGS, PERSONAS } = require('../kit/i18n');
+const { Strings, LANGS, resolveLanguage, localeOf, PERSONAS } = require('../kit/i18n');
 const PixelArt = require('../kit/pixelart');
 const { DEFAULT_SETTINGS } = require('./store');
 const { KitFrame } = require('./frame');
@@ -147,15 +147,15 @@ class KitHost {
 
   syncStrings() {
     const { settings } = this;
-    this.T.set(settings.get('language'), settings.get('personality'));
+    this.T.set(this.plugin.currentLanguage ? this.plugin.currentLanguage() : resolveLanguage(settings.get('language')), settings.get('personality'));
     this.T.context = () => {
       const last = this.state.get('lastFood');
       return {
         name: settings.get('petName'),
-        m: this.usage ? this.usage.today().c.toLocaleString() : 0,
+        m: this.usage ? this.usage.today().c.toLocaleString(localeOf(this.T.lang)) : 0,
         streak: this.gamify ? this.gamify.streaks().current : 0,
         lv: this.growth ? this.growth.level : 1,
-        coins: this.shop ? this.shop.wallet().balance.toLocaleString() : 0,
+        coins: this.shop ? this.shop.wallet().balance.toLocaleString(localeOf(this.T.lang)) : 0,
         ...(last ? { last: this.T.t('item.' + last) } : {}),
       };
     };
@@ -669,7 +669,7 @@ class KitHost {
       fur: s.get('fur'),
       bubbles: s.get('bubblesEnabled'),
       sound: s.get('soundEnabled'),
-      language: s.get('language'),
+      language: this.T.lang,
       personality: s.get('personality'),
       moodMotions: this.moodMotions(),
       idleMotions: this.idlePool(),
@@ -774,6 +774,7 @@ class KitHost {
     };
     return {
       settings: settings.data,
+      language: this.T.lang, // presentation only; never persisted in settings/state
       release: !settings.get('devUnlocked'),
       obsidian: true,
       growth: this.growth,
@@ -857,6 +858,12 @@ class KitHost {
 
   // 1분마다
   minuteTick() {
+    if (this.settings.get('language') === 'auto' && this.plugin.currentLanguage && this.T.lang !== this.plugin.currentLanguage()) {
+      this.syncStrings();
+      this.plugin.relabel();
+      this.send('pet:config', this.petConfig());
+      this.pushHouse();
+    }
     if (this.loading) return;
     const day = this.state.get('temper') && this.state.get('temper').day;
     if (day !== new Date().toDateString()) {
@@ -1230,7 +1237,7 @@ class KitHost {
     if ('scale' in allowed) allowed.scale = scaleStep(allowed.scale);
     if (!settings.get('devUnlocked')) delete allowed.devMode;
     if ('petName' in allowed) allowed.petName = String(allowed.petName).trim().slice(0, 12) || DEFAULT_SETTINGS.petName;
-    if ('language' in allowed && !LANGS.includes(allowed.language)) delete allowed.language;
+    if ('language' in allowed && allowed.language !== 'auto' && !LANGS.includes(allowed.language)) delete allowed.language;
     if ('personality' in allowed && !PERSONAS.includes(allowed.personality)) delete allowed.personality;
     if ('tugLevel' in allowed && !['easy', 'mid', 'hard'].includes(allowed.tugLevel)) delete allowed.tugLevel;
     if ('fur' in allowed) {

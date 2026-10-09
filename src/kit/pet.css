@@ -424,3 +424,10 @@ body.no-cursor #pet {
 .rps-result.lose {
   background: #b0413a;
 }
+
+html:lang(zh-CN) body {
+  font-family: 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', system-ui, sans-serif;
+}
+html:lang(zh-CN) .bubble {
+  word-break: normal;
+}

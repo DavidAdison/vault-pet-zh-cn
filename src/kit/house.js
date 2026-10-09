@@ -6,7 +6,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 
 const T = new I18N.Strings();
 const t = (key, vars) => T.t(key, vars);
-const locale = () => (T.lang === 'en' ? 'en-US' : 'ko-KR');
+const locale = () => I18N.localeOf(T.lang);
 const fmt = (n) => Math.round(n).toLocaleString(locale());
 const compact = (n) => new Intl.NumberFormat(locale(), { notation: 'compact', maximumFractionDigits: 1 }).format(n);
 // 단계 이름은 i18n 이 갖는다 (growth.js 는 key 만 보낸다)
@@ -50,7 +50,7 @@ setInterval(() => {
 const info = (key) => `<span class="info" tabindex="0" data-tip="${esc(t('tip.' + key))}">i</span>`;
 // 큰 토큰 수는 Claude Code 화면처럼 영어 줄임(7.1B)으로
 const bigTok = (n) => new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(n || 0);
-const hourName = (h) => (h == null ? '-' : T.lang === 'en' ? `${h % 12 || 12} ${h < 12 ? 'AM' : 'PM'}` : `${h < 12 ? '오전' : '오후'} ${h % 12 || 12}시`);
+const hourName = (h) => (h == null ? '-' : T.lang === 'zh-CN' ? `${h < 12 ? '上午' : '下午'}${h % 12 || 12}点` : T.lang === 'en' ? `${h % 12 || 12} ${h < 12 ? 'AM' : 'PM'}` : `${h < 12 ? '오전' : '오후'} ${h % 12 || 12}시`);
 const coins = (n, px = 14) => `${icon('coin', px)}<span>${t('shop.coin', { n: fmt(n) })}</span>`;
 // [옵시디언] 글자·링크·새 노트·세션·노트 열기 퀘스트
 const QUEST_ICON = { chars: 'scroll', links: 'pin', notes: 'map', opens: 'eye', msgs: 'chat', sessions: 'door', tokens: 'coin', replies: 'chats', xp: 'star', poke: 'paw', lift: 'heart', fed: 'ricebowl', snack: 'gift', catch: 'sparkle', rest: 'pillow', spend: 'moneybag', meal: 'ricebowl', early: 'sunrise' };
@@ -269,7 +269,7 @@ function drawCard() {
   const ink = '#3a2118';
   const muted = '#8b6f60';
   const accent = '#d97757';
-  const font = (w, px) => `${w} ${px}px Pretendard, 'Malgun Gothic', sans-serif`;
+  const font = (w, px) => `${w} ${px}px ${T.lang === 'zh-CN' ? "'Microsoft YaHei', 'PingFang SC'," : ''} Pretendard, 'Malgun Gothic', sans-serif`;
   const text = (s, x, y, f, color = ink, align = 'center') => {
     g.font = f;
     g.fillStyle = color;
@@ -389,12 +389,12 @@ function openCard() {
     if (await pet.saveCard(url, D.settings.petName)) toast(t('card.saved'), 'check');
   };
   $('#card-copy', el).onclick = async () => {
-    await pet.copyCard(url);
-    toast(t('card.copied'), 'check');
+    const ok = await pet.copyCard(url);
+    toast(t(ok ? 'card.copied' : 'card.copyError'), ok ? 'check' : 'bang');
   };
   $('#card-text', el).onclick = async () => {
-    await pet.copyText(share);
-    toast(t('card.textCopied'), 'check');
+    const ok = await pet.copyText(share);
+    toast(t(ok ? 'card.textCopied' : 'card.copyError'), ok ? 'check' : 'bang');
   };
 }
 
@@ -972,7 +972,7 @@ $('#toast').addEventListener('click', hideToast);
 function renderTop() {
   const g = D.growth;
   const s = D.settings;
-  T.set(s.language, s.personality);
+  T.set(D.language || s.language, s.personality);
   document.documentElement.lang = T.lang;
   document.title = t('top.title', { name: s.petName });
   $('#h-name').textContent = s.petName;
@@ -1671,6 +1671,8 @@ const TABS = {
           <select data-key="language">
             <option value="ko" ${s.language === 'ko' ? 'selected' : ''}>한국어</option>
             <option value="en" ${s.language === 'en' ? 'selected' : ''}>English</option>
+            <option value="zh-CN" ${s.language === 'zh-CN' ? 'selected' : ''}>简体中文</option>
+            <option value="auto" ${s.language === 'auto' ? 'selected' : ''}>${t('set.languageAuto')}</option>
           </select></div>
         <div class="field"><div class="lbl">${t('set.bubbles')}<small>${t('set.bubblesSub')}</small></div>${sw('bubblesEnabled', s.bubblesEnabled)}</div>
         <div class="field"><div class="lbl">${t('set.chatter')}<small>${t('set.chatterSub')}</small></div>${sw('chatter', s.chatter)}</div>

@@ -58,6 +58,7 @@ pet.onConfig((c) => {
   scale = c.scale;
   soundOn = c.sound;
   T.set(c.language, c.personality, c.mode);
+  document.documentElement.lang = T.lang;
   sprite.setFur(c.fur);
   bubblesOn = c.bubbles !== false;
   clearTimeout(pendingWearTimer);

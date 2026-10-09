@@ -3050,3 +3050,17 @@ input:focus-visible {
     display: none;
   }
 }
+
+/* Chinese needs natural character wrapping; keep Korean/English styles intact. */
+html:lang(zh-CN) {
+  --pixel: 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', system-ui, sans-serif;
+}
+html:lang(zh-CN) .tnm,
+html:lang(zh-CN) .inv-note,
+html:lang(zh-CN) .toy-guide p,
+html:lang(zh-CN) .fr-motto,
+html:lang(zh-CN) .ws-grid > .ws-card .nm,
+html:lang(zh-CN) .ws-grid > .ws-card .ws-mats li .nm {
+  word-break: normal;
+  overflow-wrap: anywhere;
+}

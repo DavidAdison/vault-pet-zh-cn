@@ -3,7 +3,7 @@
 
 const DEFAULT_SETTINGS = {
   petName: '킷',
-  language: 'ko', // 'ko' | 'en'
+  language: 'auto', // 'auto' | 'ko' | 'en' | 'zh-CN'; existing explicit choices are retained
   personality: 'angel',
   scale: 3, // 1~5 다섯 단계 → 배율 1·1.5·2·2.5·3배
   fur: 'cheese',

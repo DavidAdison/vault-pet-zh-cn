@@ -487,6 +487,12 @@
       'obs.cmd.stopPlay': 'Stop playing',
     },
   };
+  UI.ko['set.languageAuto'] = '옵시디언 언어 따르기';
+  UI.en['set.languageAuto'] = 'Follow Obsidian';
+  UI.ko['obs.cardError'] = '카드를 저장하지 못했어요: {err}';
+  UI.en['obs.cardError'] = 'Could not save the card: {err}';
+  UI.ko['card.copyError'] = '복사하지 못했어요. 클립보드 권한을 확인하고 다시 시도해 주세요';
+  UI.en['card.copyError'] = 'Copy failed. Check clipboard permissions and try again';
   for (const a of ACH) {
     Object.assign(UI.ko, a.ko);
     Object.assign(UI.en, a.en);

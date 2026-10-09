@@ -27,7 +27,7 @@ class FakeMenu {
   showAtPosition() {}
   showAtMouseEvent() {}
 }
-const fakeObsidian = { Menu: FakeMenu, Notice: class {}, setIcon() {}, Plugin: class {}, ItemView: class {}, PluginSettingTab: class {}, Setting: class {}, TFile: class {}, TFolder: class {}, addIcon() {} };
+const fakeObsidian = { Menu: FakeMenu, Notice: class {}, setIcon() {}, Plugin: class {}, Modal: class {}, ItemView: class {}, PluginSettingTab: class {}, Setting: class {}, TFile: class {}, TFolder: class {}, addIcon() {} };
 const origLoad = Module._load;
 Module._load = function (request, parent, isMain) {
   if (request === 'obsidian') return fakeObsidian;
@@ -45,6 +45,7 @@ const { KitHost, STATE_DEFAULTS } = require(path.join(src, 'plugin/host'));
 const I18N = require(path.join(src, 'kit/i18n'));
 globalThis.I18N = I18N;
 require(path.join(src, 'kit/i18n-obsidian'));
+require(path.join(src, 'kit/i18n-zh-CN'));
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -147,12 +148,12 @@ test('achievements: 아이디가 겹치지 않고, 이름·설명·묶음 이름
   for (const a of ACHIEVEMENTS) {
     assert.ok(!ids.has(a.id), 'dup ' + a.id);
     ids.add(a.id);
-    for (const lang of ['ko', 'en']) {
+    for (const lang of I18N.LANGS) {
       assert.ok(I18N.UI[lang][`ach.${a.id}.name`], `${lang} ach.${a.id}.name`);
       assert.ok(I18N.UI[lang][`ach.${a.id}.desc`], `${lang} ach.${a.id}.desc`);
     }
   }
-  for (const c of CATS) for (const lang of ['ko', 'en']) assert.ok(I18N.UI[lang]['ach.cat.' + c], `${lang} ach.cat.${c}`);
+  for (const c of CATS) for (const lang of I18N.LANGS) assert.ok(I18N.UI[lang]['ach.cat.' + c], `${lang} ach.cat.${c}`);
 });
 
 test('i18n: 퀘스트·홈·설정 글에 Claude·토큰 이야기가 안 남았다', () => {
@@ -556,6 +557,146 @@ test('styles: 테마가 iframe 에 칠하는 배경·테두리·그림자를 펫
   for (const p of ['background: transparent', 'border: 0', 'border-radius: 0', 'box-shadow: none']) {
     assert.ok(m[1].includes(`${p} !important`), p);
   }
+});
+
+test('zh-CN: all UI keys are translated with identical placeholders and markup', () => {
+  const zh = I18N.UI['zh-CN'];
+  const vars = (s) => [...String(s).matchAll(/\{(\w+)(?:#[^}]*)?\}/g)].map((m) => m[1]).sort();
+  const tags = (s) => (s.match(/<\/?[a-z][^>]*>/gi) || []).sort();
+  const T = new I18N.Strings('zh-CN');
+  for (const [key, value] of Object.entries(I18N.UI.en)) {
+    assert.strictEqual(typeof zh[key], 'string', 'missing: ' + key);
+    assert.ok(zh[key].trim(), 'empty: ' + key);
+    assert.deepStrictEqual(vars(zh[key]), vars(value), 'placeholders: ' + key);
+    assert.deepStrictEqual(tags(zh[key]), tags(value), 'markup: ' + key);
+    assert.ok(!/[\uac00-\ud7a3]/.test(zh[key]), 'Korean leaked: ' + key);
+    assert.strictEqual(T.t(key), zh[key], 'unexpected fallback: ' + key);
+    if (value.includes('|')) {
+      assert.strictEqual(zh[key].split('|').length, value.split('|').length, 'dialogue parts: ' + key);
+      if (/^fr\..+\.talk\d+$/.test(key)) {
+        assert.deepStrictEqual(zh[key].split('|').map((s) => s.slice(0, 2)), value.split('|').map((s) => s.slice(0, 2)), 'speaker markers: ' + key);
+      }
+    }
+  }
+});
+
+test('zh-CN: every dialogue variant retains its variables and follow-up bubbles', () => {
+  const kinds = new Set([...Object.keys(I18N.LINE.ko), ...Object.keys(I18N.LINE.en)]);
+  const vars = (s) => [...s.matchAll(/\{(\w+)(?:#[^}]*)?\}/g)].map((m) => m[1]).sort();
+  for (const kind of kinds) {
+    const original = (I18N.LINE.en[kind] || I18N.LINE.ko[kind]).angel;
+    const translated = I18N.LINE['zh-CN'][kind].angel;
+    assert.strictEqual(translated.length, original.length, kind);
+    for (let n = 0; n < original.length; n++) {
+      assert.deepStrictEqual(vars(translated[n]), vars(original[n]), kind + ' variables');
+      assert.strictEqual(translated[n].split('||').length, original[n].split('||').length, kind + ' bubbles');
+      assert.ok(!/[\uac00-\ud7a3]/.test(translated[n]), kind);
+    }
+  }
+  const T = new I18N.Strings('zh-CN');
+  assert.ok(!T.line('achieve', { title: '第一笔', xp: 10 }).includes('{'));
+  assert.ok(!T.line('hello', { name: '小纪' }).includes('{'));
+});
+
+test('language: Obsidian codes, manual choices and locale formatting', () => {
+  for (const code of ['zh', 'zh-cn', 'zh_CN', 'zh-Hans', 'zh-Hans-CN', 'zh-SG']) assert.strictEqual(I18N.resolveLanguage('auto', code), 'zh-CN', code);
+  for (const code of ['zh-TW', 'zh-Hant', 'zh-HK', 'ja', 'fr', 'en', '']) assert.strictEqual(I18N.resolveLanguage('auto', code), 'en', code);
+  assert.strictEqual(I18N.resolveLanguage('auto', 'ko-KR'), 'ko');
+  assert.strictEqual(I18N.resolveLanguage('en', 'zh'), 'en');
+  assert.strictEqual(I18N.resolveLanguage('ko', 'zh'), 'ko');
+  assert.strictEqual(I18N.resolveLanguage('zh-CN', 'en'), 'zh-CN');
+  assert.strictEqual(I18N.localeOf('zh-CN'), 'zh-CN');
+  assert.ok(new Intl.NumberFormat(I18N.localeOf('zh-CN'), { notation: 'compact' }).format(10000).includes('万'));
+});
+
+test('host: language switching preserves save fields and game progress', () => {
+  const { host, settings, state } = makeHost({ settings: { language: 'en', petName: 'My Cat' } });
+  const stateBefore = JSON.stringify(state.data);
+  const settingsBefore = { ...settings.data };
+  for (const lang of ['zh-CN', 'ko', 'en', 'auto', 'zh-CN']) {
+    host.setSettings({ language: lang });
+    assert.strictEqual(settings.get('language'), lang);
+    const expected = lang === 'auto' ? 'en' : lang;
+    assert.strictEqual(host.T.lang, expected);
+    assert.strictEqual(host.petConfig().language, expected);
+    assert.strictEqual(host.housePayload().language, expected);
+    assert.strictEqual(JSON.stringify(state.data), stateBefore, 'state changed on language switch');
+    assert.deepStrictEqual({ ...settings.data, language: 'en' }, settingsBefore, 'settings structure changed');
+  }
+  host.setSettings({ language: 'not-a-language' });
+  assert.strictEqual(settings.get('language'), 'zh-CN');
+  host.destroy();
+});
+
+test('host: follow Obsidian updates both renderers without replacing auto in the save', () => {
+  const { host, settings, plugin, sent } = makeHost({ settings: { language: 'auto' } });
+  plugin.currentLanguage = () => 'zh-CN';
+  host.minuteTick();
+  assert.strictEqual(host.T.lang, 'zh-CN');
+  assert.strictEqual(settings.get('language'), 'auto');
+  assert.ok(sent.some(([ch, p]) => ch === 'pet:config' && p.language === 'zh-CN'));
+  assert.strictEqual(host.housePayload().language, 'zh-CN');
+  plugin.currentLanguage = () => 'ko';
+  host.minuteTick();
+  assert.strictEqual(host.T.lang, 'ko');
+  host.destroy();
+});
+
+test('built plugin: host and iframe receive the same Chinese resources', () => {
+  const fs = require('fs');
+  const vm = require('vm');
+  const bundled = fs.readFileSync(path.join(src, '..', 'main.js'), 'utf8');
+  const box = { require: (id) => id === 'obsidian' ? fakeObsidian : require(id), module: { exports: {} } };
+  vm.runInNewContext(bundled + "\nmodule.exports._testI18N = __require('plugin/main')('../kit/i18n'); module.exports._testAssets = __require('plugin/main')('./kit-assets');", box);
+  const I = box.module.exports._testI18N;
+  assert.strictEqual(I.UI['zh-CN']['tab.shop'], '商店');
+  assert.ok(I.LANGS.includes('zh-CN'));
+  // Exercise the actual compiled renderer initializer up to its pet/house branch.
+  const initializer = box.module.exports._testAssets.run.toString().split("\n  if (kind === 'pet')")[0] + '\n}';
+  const renderer = Object.fromEntries(['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'getComputedStyle', 'confirm'].map((key) => [key, () => {}]));
+  renderer.window = renderer;
+  vm.runInNewContext('(' + initializer + ')', {})(renderer, {}, {}, '');
+  assert.strictEqual(renderer.I18N.UI['zh-CN']['tab.shop'], '商店');
+  assert.strictEqual(renderer.I18N.LINE['zh-CN'].hello.angel[0], I.LINE['zh-CN'].hello.angel[0]);
+});
+
+test('plugin: Obsidian language detection respects saved manual choices', () => {
+  const Plugin = require(path.join(src, 'plugin/main'));
+  fakeObsidian.getLanguage = () => 'zh';
+  try {
+    for (const [language, expected] of [['auto', 'zh-CN'], ['en', 'en'], ['ko', 'ko'], ['zh-CN', 'zh-CN']]) {
+      const settings = new Store({ language }, DEFAULT_SETTINGS, () => {});
+      assert.strictEqual(Plugin.prototype.currentLanguage.call({ settings }), expected);
+    }
+  } finally {
+    delete fakeObsidian.getLanguage;
+  }
+});
+
+test('plugin: registered command labels change without changing command IDs', () => {
+  const Plugin = require(path.join(src, 'plugin/main'));
+  const p = { host: { T: new I18N.Strings('en') }, addCommand: (command) => command, updateStatus() {}, houseViews: () => [] };
+  Plugin.prototype.addCommands.call(p);
+  const ids = p.localizedCommands.map(({ command }) => command.id);
+  assert.strictEqual(ids.length, 13);
+  p.host.T.set('zh-CN');
+  Plugin.prototype.relabel.call(p);
+  assert.deepStrictEqual(p.localizedCommands.map(({ command }) => command.id), ids);
+  for (const { command, key } of p.localizedCommands) assert.strictEqual(command.name, I18N.UI['zh-CN'][key]);
+});
+
+test('renderer: Chinese motion banners use CJK glyphs instead of blank bitmap letters', () => {
+  const vm = require('vm');
+  const renderer = { document: { documentElement: { lang: 'zh-CN' } }, I18N };
+  renderer.window = renderer;
+  vm.runInNewContext(require('fs').readFileSync(path.join(src, 'kit/sprite.js'), 'utf8'), renderer);
+  const drawn = [];
+  const ctx = { save() {}, restore() {}, strokeText() {}, fillText: (s) => drawn.push(s), fillRect() {} };
+  renderer.PetSprite.util.drawText(ctx, 'LEVEL UP!', 7, 6, '#fff');
+  assert.deepStrictEqual(drawn, ['升级！']);
+  renderer.document.documentElement.lang = 'en';
+  renderer.PetSprite.util.drawText(ctx, 'LEVEL UP!', 7, 6, '#fff');
+  assert.strictEqual(drawn.length, 1, 'English keeps the existing bitmap font');
 });
 
 (async () => {

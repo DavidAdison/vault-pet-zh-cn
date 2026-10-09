@@ -1,0 +1,28 @@
+name: Build and test
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node scripts/build.js
+      - run: node tests/run.js
+      - run: node scripts/package.js
+      - name: Validate install ZIP and ensure it contains no saves
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('dist/vault-pet-zh-cn.zip') as archive:
+              assert archive.testzip() is None
+              assert len(archive.namelist()) == 8
+              assert all(p.startswith('vault-pet/') for p in archive.namelist())
+              assert not any('data.json' in p or 'data.backup' in p for p in archive.namelist())
+          PY

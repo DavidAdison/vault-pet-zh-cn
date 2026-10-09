@@ -17,7 +17,16 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.I18N = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
-  const LANGS = ['ko', 'en'];
+  const LANGS = ['ko', 'en', 'zh-CN'];
+  // Obsidian calls Simplified Chinese "zh"; moment may call it "zh-cn".
+  // Traditional Chinese keeps the existing English fallback.
+  function resolveLanguage(language, obsidianLanguage = 'en') {
+    if (LANGS.includes(language)) return language;
+    const code = String(language === 'auto' ? obsidianLanguage : language || obsidianLanguage).toLowerCase().replace(/_/g, '-');
+    if (/^zh(?:-cn|-sg|-hans(?:-.+)?)?$/.test(code)) return 'zh-CN';
+    return code.startsWith('ko') ? 'ko' : 'en';
+  }
+  const localeOf = (language) => ({ ko: 'ko-KR', en: 'en-US', 'zh-CN': 'zh-CN' })[language] || 'en-US';
   const PERSONAS = ['angel'];
   const DEFAULT_LANG = 'ko';
   const DEFAULT_PERSONA = 'angel';
@@ -4674,5 +4683,5 @@
     }
   }
 
-  return { Strings, LANGS, PERSONAS, OLD_PERSONA, DEFAULT_LANG, DEFAULT_PERSONA, UI, LINE, josa, fill, pick };
+  return { Strings, LANGS, resolveLanguage, localeOf, PERSONAS, OLD_PERSONA, DEFAULT_LANG, DEFAULT_PERSONA, UI, LINE, josa, fill, pick };
 });

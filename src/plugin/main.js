@@ -14,6 +14,7 @@
 const obsidian = require('obsidian');
 const { Plugin, ItemView, Modal, PluginSettingTab, Setting, Notice, TFile, TFolder, addIcon, setIcon } = obsidian;
 const { Store, DEFAULT_SETTINGS } = require('./store');
+const { resolveLanguage, localeOf } = require('../kit/i18n');
 const { KitHost, STATE_DEFAULTS } = require('./host');
 const { KitFrame } = require('./frame');
 const { PetStage } = require('./stage');
@@ -24,7 +25,7 @@ const { UsageTracker, measure, folderKey, folderOf, LIVE_CHAR_CAP, LIVE_LINK_CAP
 
 const VIEW_TYPE = 'kitcommit-house';
 const DATA_VERSION = 1;
-const FEEDBACK_URL = 'https://github.com/elliott-json-park/obsidian-vault-pet/issues/new/choose'; // 버그·아이디어 (누를 때만 브라우저로 연다)
+const FEEDBACK_URL = 'https://github.com/DavidAdison/vault-pet-zh-cn/issues/new/choose'; // Localization feedback belongs to this distribution.
 const MIN = 60_000;
 const PASTE_KEEP = MIN; // 붙여 넣은 글을 '세지 않을 몫'으로 들고 있는 시간
 const TYPE_STOP = 20_000; // 이만큼 손을 떼면 한 차례 쓰기가 끝난 것 (데스크톱판의 'Claude 가 답을 끝냈다')
@@ -184,6 +185,8 @@ class KitSettingTab extends PluginSettingTab {
         d
           .addOption('ko', '한국어')
           .addOption('en', 'English')
+          .addOption('zh-CN', '简体中文')
+          .addOption('auto', t('set.languageAuto'))
           .setValue(p.settings.get('language'))
           .onChange((v) => {
             p.host.setSettings({ language: v });
@@ -213,7 +216,7 @@ class LegacyModal extends Modal {
     const p = this.plugin;
     const t = (k, v) => p.host.T.t(k, v);
     const L = p.meta.legacy;
-    const fmt = (n) => Number(n).toLocaleString(p.settings.get('language') === 'ko' ? 'ko-KR' : 'en-US');
+    const fmt = (n) => Number(n).toLocaleString(localeOf(p.host.T.lang));
     this.modalEl.addClass('vaultpet-legacy');
     this.titleEl.setText(t('legacy.title'));
     const el = this.contentEl;
@@ -280,11 +283,11 @@ class KitCommitPlugin extends Plugin {
     // 처음 설치하면 옵시디언 언어를 따른다
     if (firstInstall) {
       if (!(raw.settings || {}).language) {
-        const lang = obsidianLanguage();
-        this.settings.data.language = lang.startsWith('ko') ? 'ko' : 'en';
+        this.settings.data.language = 'auto';
       }
       if (legacy && legacy.petName) this.settings.data.petName = legacy.petName;
-      else if (this.settings.data.language === 'en') this.settings.data.petName = 'Kit';
+      else if (this.currentLanguage() === 'en') this.settings.data.petName = 'Kit';
+      else if (this.currentLanguage() === 'zh-CN') this.settings.data.petName = '小纪';
     }
     this.pending = new Set();
     this.pasted = new Map(); // 노트 경로 → 붙여넣기·끌어다 놓기로 들어온 글 { c, l, at } (세지 않는다)
@@ -334,9 +337,17 @@ class KitCommitPlugin extends Plugin {
     if (this.host) this.host.destroy();
   }
 
+  currentLanguage() {
+    return resolveLanguage(this.settings.get('language'), obsidianLanguage());
+  }
+
   addCommands() {
     const T = () => this.host.T;
-    const cmd = (id, key, callback) => this.addCommand({ id, name: T().t(key), callback });
+    this.localizedCommands = [];
+    const cmd = (id, key, callback) => {
+      const command = this.addCommand({ id, name: T().t(key), callback });
+      this.localizedCommands.push({ command, key });
+    };
     cmd('open-house', 'obs.cmd.house', () => this.openHouse());
     cmd('open-house-sidebar', 'obs.cmd.houseSide', () => this.openHouse(null, 'side'));
     cmd('open-quests', 'obs.cmd.quests', () => this.openHouse('quests'));
@@ -730,7 +741,7 @@ class KitCommitPlugin extends Plugin {
       return true;
     } catch (e) {
       console.error('[Vault Pet] card', e);
-      new Notice(String(e && e.message ? e.message : e));
+      new Notice(this.host.T.t('obs.cardError', { err: String(e && e.message ? e.message : e) }));
       return false;
     }
   }
@@ -838,6 +849,7 @@ class KitCommitPlugin extends Plugin {
 
   // 언어가 바뀌면 탭 이름·리본 설명을 다시
   relabel() {
+    for (const { command, key } of this.localizedCommands || []) if (command) command.name = this.host.T.t(key);
     this._status = null;
     this.updateStatus();
     if (this.ribbon) this.ribbon.setAttribute('aria-label', this.host.T.t('obs.openHouse'));

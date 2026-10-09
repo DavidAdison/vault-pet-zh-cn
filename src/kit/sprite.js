@@ -244,7 +244,13 @@
     ' ': ['..', '..', '..', '..', '..'],
   };
 
+  function localizedText(s) {
+    if (typeof document === 'undefined' || document.documentElement.lang !== 'zh-CN' || typeof I18N === 'undefined') return s;
+    return (I18N.UI['zh-CN'] || {})['fx.' + s] || s;
+  }
   function textWidth(s) {
+    s = localizedText(s);
+    if (/[\u3400-\u9fff]/.test(s)) return [...s].length * 7;
     let w = 0;
     for (const ch of s) w += (FONT[ch] || FONT[' '])[0].length + 1;
     return w - 1;
@@ -263,6 +269,21 @@
     });
   };
   function drawText(ctx, s, x, y, fill, outline = '#2b1a10') {
+    s = localizedText(s);
+    if (/[\u3400-\u9fff]/.test(s)) {
+      // The existing 3x5 bitmap alphabet has no Chinese glyphs.
+      ctx.save();
+      ctx.font = '7px "Microsoft YaHei", "PingFang SC", sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = outline;
+      ctx.fillStyle = fill;
+      ctx.strokeText(s, Math.round(x), Math.round(y));
+      ctx.fillText(s, Math.round(x), Math.round(y));
+      ctx.restore();
+      return;
+    }
     const glyphs = [];
     let cx = Math.round(x);
     for (const ch of s) {
